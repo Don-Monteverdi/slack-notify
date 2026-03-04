@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Global pre-push hook — notify Slack + chain to local hooks
+#
+# Git passes: remote-name remote-url as args
+# Git sends on stdin: <local-ref> <local-sha> <remote-ref> <remote-sha> (one line per ref)
+#
+# Installed via: slack-notify install.sh --git-hooks
+
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+REMOTE_NAME="${1:-origin}"
+
+# Read stdin (ref info from git) — save it so we can pass to both our script and local hook
+STDIN_DATA=$(cat)
+
+# For each ref being pushed, fire a notification in background
+if [ -n "$STDIN_DATA" ]; then
+    echo "$STDIN_DATA" | while IFS=' ' read -r local_ref local_sha remote_ref remote_sha; do
+        "$HOOK_DIR/_slack-notify-commit.sh" \
+            --event pushed \
+            --remote "$REMOTE_NAME" \
+            --refs "$local_ref" "$local_sha" "$remote_ref" "$remote_sha" &
+    done
+fi
+
+# Chain to repo-local hook if it exists
+GIT_DIR="$(git rev-parse --git-dir 2>/dev/null)"
+if [ -n "$GIT_DIR" ]; then
+    LOCAL_HOOK="$GIT_DIR/hooks/pre-push"
+    if [ -x "$LOCAL_HOOK" ]; then
+        # Replay stdin for the local hook
+        echo "$STDIN_DATA" | exec "$LOCAL_HOOK" "$@"
+    fi
+fi
+
+exit 0

@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+# slack-daemon — Persistent Slack response daemon
+#
+# Polls a Slack channel every 15s, routes new messages to claude -p, replies in thread.
+# Manage with: slack-daemon-ctl start|stop|status|logs
+#
+# Requires: SLACK_BOT_USER_ID in config (to skip own messages)
+# Requires: claude binary on PATH (or SLACK_NOTIFY_CLAUDE_BIN set)
+
+set -uo pipefail
+
+# ── Config ──────────────────────────────────────────────────────────────────
+# Inline config loading (daemon may cd elsewhere, can't depend on lib/)
+SLACK_NOTIFY_CONFIG="${SLACK_NOTIFY_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/slack-notify/.env}"
+if [ ! -f "$SLACK_NOTIFY_CONFIG" ]; then
+    echo "FATAL: Missing $SLACK_NOTIFY_CONFIG" >&2
+    exit 1
+fi
+# shellcheck disable=SC1090
+source "$SLACK_NOTIFY_CONFIG"
+
+# Resolve claude binary
+CLAUDE_BIN="${SLACK_NOTIFY_CLAUDE_BIN:-$(command -v claude 2>/dev/null || echo "")}"
+if [ -z "$CLAUDE_BIN" ]; then
+    echo "FATAL: claude binary not found. Install Claude Code or set SLACK_NOTIFY_CLAUDE_BIN" >&2
+    exit 1
+fi
+
+# Project directory for claude context
+PROJECT_DIR="${SLACK_NOTIFY_PROJECT_DIR:-$(pwd)}"
+
+# Polling interval
+POLL_INTERVAL="${SLACK_NOTIFY_POLL_INTERVAL:-15}"
+
+# State / runtime directories (XDG-compliant)
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/slack-notify"
+RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/slack-notify"
+mkdir -p "$STATE_DIR" "$RUN_DIR"
+
+STATE_FILE="${STATE_DIR}/daemon-last-ts"
+PID_FILE="${RUN_DIR}/daemon.pid"
+LOCK_FILE="${RUN_DIR}/daemon.lock"
+LOG_FILE="${STATE_DIR}/daemon.log"
+
+# Bot user ID (required to skip own messages)
+BOT_USER_ID="${SLACK_BOT_USER_ID:-}"
+if [ -z "$BOT_USER_ID" ]; then
+    echo "FATAL: SLACK_BOT_USER_ID not set in $SLACK_NOTIFY_CONFIG (required for daemon)" >&2
+    exit 1
+fi
+
+MAX_LOG_LINES="${SLACK_NOTIFY_MAX_LOG_LINES:-1000}"
+
+# ── Custom prompt ───────────────────────────────────────────────────────────
+DAEMON_PROMPT_FILE="${SLACK_NOTIFY_DAEMON_PROMPT:-}"
+DEFAULT_PROMPT="You are a helpful assistant responding to a Slack message.
+Keep responses concise — this is Slack, not a document. Use Slack mrkdwn (*bold*, _italic_, \`code\`).
+Your working directory is: ${PROJECT_DIR}"
+
+# ── Helpers ─────────────────────────────────────────────────────────────────
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"
+}
+
+rotate_log() {
+    if [ -f "$LOG_FILE" ] && [ "$(wc -l < "$LOG_FILE")" -gt "$MAX_LOG_LINES" ]; then
+        tail -n "$MAX_LOG_LINES" "$LOG_FILE" > "${LOG_FILE}.tmp"
+        mv "${LOG_FILE}.tmp" "$LOG_FILE"
+    fi
+}
+
+slack_react() {
+    local TS="$1" EMOJI="${2:-eyes}"
+    curl -s -X POST "https://slack.com/api/reactions.add" \
+        -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+        -H "Content-Type: application/json" \
+        -d "{\"channel\":\"$SLACK_CHANNEL_ID\",\"timestamp\":\"$TS\",\"name\":\"$EMOJI\"}" \
+        >/dev/null 2>&1
+}
+
+slack_post_thread() {
+    local TEXT="$1" THREAD_TS="$2"
+    python3 -c "
+import json, sys, urllib.request
+
+payload = json.dumps({
+    'channel': '$SLACK_CHANNEL_ID',
+    'text': sys.argv[1],
+    'thread_ts': sys.argv[2],
+    'unfurl_links': False
+}).encode()
+
+req = urllib.request.Request(
+    'https://slack.com/api/chat.postMessage',
+    data=payload,
+    headers={
+        'Authorization': 'Bearer $SLACK_BOT_TOKEN',
+        'Content-Type': 'application/json'
+    }
+)
+try:
+    urllib.request.urlopen(req, timeout=10)
+except Exception:
+    pass
+" "$TEXT" "$THREAD_TS" 2>/dev/null
+}
+
+cleanup() {
+    log "Shutting down (PID $$)"
+    rm -f "$PID_FILE" "$LOCK_FILE"
+    exit 0
+}
+
+# ── Init ────────────────────────────────────────────────────────────────────
+
+cd "$PROJECT_DIR" || exit 1
+
+# Write PID
+echo $$ > "$PID_FILE"
+
+# Trap signals for clean shutdown
+trap cleanup SIGTERM SIGINT SIGHUP
+
+# Initialize state file if missing (start from now)
+if [ ! -f "$STATE_FILE" ]; then
+    python3 -c "import time; print(f'{time.time():.6f}')" > "$STATE_FILE"
+fi
+
+log "Daemon started (PID $$, polling every ${POLL_INTERVAL}s, project: ${PROJECT_DIR})"
+
+# ── Main Loop ───────────────────────────────────────────────────────────────
+
+while true; do
+    rotate_log
+
+    LAST_TS=$(cat "$STATE_FILE" 2>/dev/null || echo "0")
+
+    # Poll Slack for new messages
+    RESPONSE=$(curl -s \
+        -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+        "https://slack.com/api/conversations.history?channel=${SLACK_CHANNEL_ID}&oldest=${LAST_TS}&limit=10" \
+        --max-time 10 2>/dev/null)
+
+    # Parse messages — filter human messages only (skip bots, self, system events)
+    MESSAGES=$(python3 -c "
+import json, sys
+try:
+    data = json.loads(sys.argv[1])
+    if not data.get('ok'):
+        sys.exit(0)
+    msgs = data.get('messages', [])
+    bot_uid = sys.argv[2]
+    results = []
+    for m in reversed(msgs):  # oldest first
+        # Skip bot messages, own messages, subtypes (joins, leaves, etc.)
+        if m.get('bot_id') or m.get('subtype'):
+            continue
+        if m.get('user') == bot_uid:
+            continue
+        ts = m.get('ts', '')
+        user = m.get('user', 'unknown')
+        text = m.get('text', '').replace('\t', ' ')[:2000]
+        if text.strip():
+            results.append(f'{ts}\t{user}\t{text}')
+    for r in results:
+        print(r)
+except Exception:
+    pass
+" "$RESPONSE" "$BOT_USER_ID" 2>/dev/null)
+
+    # Process each new message
+    if [ -n "$MESSAGES" ]; then
+        while IFS=$'\t' read -r MSG_TS MSG_USER MSG_TEXT; do
+            [ -z "$MSG_TEXT" ] && continue
+
+            log "New message from $MSG_USER: ${MSG_TEXT:0:100}..."
+
+            # Skip if already processing (lock file)
+            if [ -f "$LOCK_FILE" ]; then
+                log "Skipping — already processing a request"
+                continue
+            fi
+
+            # Acquire lock
+            echo $$ > "$LOCK_FILE"
+
+            # React with eyes
+            slack_react "$MSG_TS" "eyes"
+
+            # Build prompt
+            PROMPT="$DEFAULT_PROMPT"
+            if [ -n "$DAEMON_PROMPT_FILE" ] && [ -f "$DAEMON_PROMPT_FILE" ]; then
+                PROMPT=$(cat "$DAEMON_PROMPT_FILE")
+            fi
+
+            FULL_PROMPT="${PROMPT}
+
+User <@${MSG_USER}> says:
+${MSG_TEXT}"
+
+            # Invoke Claude (non-interactive)
+            log "Invoking claude -p..."
+            CLAUDE_RESPONSE=$(CLAUDECODE="" "$CLAUDE_BIN" -p \
+                --model opus \
+                --permission-mode bypassPermissions \
+                --allowedTools "Bash,Read,Glob,Grep,WebSearch,WebFetch" \
+                --max-budget-usd 2.00 \
+                --output-format text \
+                --no-session-persistence \
+                "$FULL_PROMPT" 2>/dev/null) || true
+
+            # Post response in thread
+            if [ -n "$CLAUDE_RESPONSE" ]; then
+                # Truncate to Slack's 4000 char limit
+                TRUNCATED=$(echo "$CLAUDE_RESPONSE" | head -c 3900)
+                if [ ${#CLAUDE_RESPONSE} -gt 3900 ]; then
+                    TRUNCATED="${TRUNCATED}... _(truncated)_"
+                fi
+
+                slack_post_thread "$TRUNCATED" "$MSG_TS"
+                log "Response posted in thread (${#CLAUDE_RESPONSE} chars)"
+
+                # React with checkmark
+                slack_react "$MSG_TS" "white_check_mark"
+            else
+                log "WARNING: Empty response from claude"
+                slack_react "$MSG_TS" "warning"
+            fi
+
+            # Release lock
+            rm -f "$LOCK_FILE"
+
+            # Update state to this message's timestamp
+            echo "$MSG_TS" > "$STATE_FILE"
+
+        done <<< "$MESSAGES"
+    fi
+
+    sleep "$POLL_INTERVAL"
+done

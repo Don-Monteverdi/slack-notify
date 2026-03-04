@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# slack-check — Read recent messages from a Slack channel
+#
+# Usage:
+#   slack-check              # Last 10 messages
+#   slack-check --count 20   # Last 20 messages
+#   slack-check --since 2h   # Messages from last 2 hours
+#   slack-check --channel C0OTHER  # Different channel
+#
+# Output: Formatted text with sender, timestamp, and message content
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/../lib/config.sh"
+
+# Parse arguments
+CHANNEL="${SLACK_CHANNEL_ID}"
+COUNT=10
+SINCE=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --count)   COUNT="$2"; shift 2 ;;
+        --since)   SINCE="$2"; shift 2 ;;
+        --channel) CHANNEL="$2"; shift 2 ;;
+        *) echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
+done
+
+# Build API URL
+API_URL="https://slack.com/api/conversations.history?channel=${CHANNEL}&limit=${COUNT}"
+
+# Add oldest timestamp if --since specified
+if [ -n "$SINCE" ]; then
+    OLDEST=$(python3 -c "
+import time, re, sys
+s = '$SINCE'
+m = re.match(r'^(\d+)(h|m|d)$', s)
+if not m:
+    print('', file=sys.stderr)
+    sys.exit(1)
+val, unit = int(m.group(1)), m.group(2)
+secs = val * {'h': 3600, 'm': 60, 'd': 86400}[unit]
+print(f'{time.time() - secs:.6f}')
+" 2>/dev/null)
+    if [ -n "$OLDEST" ]; then
+        API_URL="${API_URL}&oldest=${OLDEST}"
+    fi
+fi
+
+# Fetch messages
+RESPONSE=$(curl -s -H "Authorization: Bearer $SLACK_BOT_TOKEN" "$API_URL")
+
+# Format and display
+CHAN_NAME="$SLACK_CHANNEL_NAME"
+python3 -c "
+import json, sys
+from datetime import datetime
+
+data = json.load(sys.stdin)
+if not data.get('ok'):
+    print(f\"ERROR: {data.get('error', 'unknown')}\", file=sys.stderr)
+    sys.exit(1)
+
+messages = data.get('messages', [])
+chan = sys.argv[1]
+if not messages:
+    print(f'No recent messages in #{chan}')
+    sys.exit(0)
+
+# Reverse to show oldest first
+messages.reverse()
+
+print(f'--- #{chan} — {len(messages)} recent messages ---')
+print()
+
+for msg in messages:
+    ts = float(msg.get('ts', 0))
+    dt = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M')
+    user = msg.get('user', 'bot')
+    text = msg.get('text', '').replace('\n', '\n  ')
+    subtype = msg.get('subtype', '')
+
+    if subtype in ('channel_join', 'channel_leave'):
+        continue
+
+    # Truncate long messages
+    if len(text) > 500:
+        text = text[:500] + '...'
+
+    print(f'[{dt}] {user}:')
+    print(f'  {text}')
+    print()
+" "$CHAN_NAME" <<< "$RESPONSE"

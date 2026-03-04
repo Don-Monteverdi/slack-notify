@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Global post-commit hook — notify Slack + chain to local hooks
+#
+# Installed via: slack-notify install.sh --git-hooks
+
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Run Slack notification in background (non-blocking)
+"$HOOK_DIR/_slack-notify-commit.sh" --event committed &
+
+# Chain to repo-local hook if it exists
+GIT_DIR="$(git rev-parse --git-dir 2>/dev/null)"
+if [ -n "$GIT_DIR" ]; then
+    LOCAL_HOOK="$GIT_DIR/hooks/post-commit"
+    if [ -x "$LOCAL_HOOK" ]; then
+        exec "$LOCAL_HOOK" "$@"
+    fi
+fi
+
+exit 0

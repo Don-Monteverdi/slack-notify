@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# slack-notify — Post formatted deliverable notifications to Slack
+#
+# Usage:
+#   slack-notify --type html   --url "https://..." --title "Page Name"
+#   slack-notify --type google --url "https://..." --title "Doc Name"
+#   slack-notify --type pen    --path "designs/file.pen" --title "Spec Name"
+#   slack-notify --type image  --path "exports/file.png" --title "Image Name"
+#
+# Delegates to slack-post for the actual Slack API call.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Parse arguments
+TYPE=""
+URL=""
+FILE_PATH=""
+TITLE=""
+THREAD_TS=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --type)    TYPE="$2";      shift 2 ;;
+        --url)     URL="$2";       shift 2 ;;
+        --path)    FILE_PATH="$2"; shift 2 ;;
+        --title)   TITLE="$2";     shift 2 ;;
+        --thread)  THREAD_TS="$2"; shift 2 ;;
+        *) echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
+done
+
+if [ -z "$TYPE" ] || [ -z "$TITLE" ]; then
+    echo "Usage: slack-notify --type <html|google|pen|image> --title \"Name\" [--url URL] [--path PATH] [--thread TS]" >&2
+    exit 1
+fi
+
+# Build message based on type
+case "$TYPE" in
+    html)
+        [ -z "$URL" ] && { echo "ERROR: --url required for type html" >&2; exit 1; }
+        MSG=":globe_with_meridians: *HTML Deployed* — <${URL}|${TITLE}>"
+        ;;
+    google)
+        [ -z "$URL" ] && { echo "ERROR: --url required for type google" >&2; exit 1; }
+        MSG=":page_facing_up: *Google Doc* — <${URL}|${TITLE}>"
+        ;;
+    pen)
+        [ -z "$FILE_PATH" ] && { echo "ERROR: --path required for type pen" >&2; exit 1; }
+        MSG=":pencil2: *Design Spec* — \`${FILE_PATH}\` — ${TITLE}"
+        ;;
+    image)
+        [ -z "$FILE_PATH" ] && { echo "ERROR: --path required for type image" >&2; exit 1; }
+        MSG=":frame_with_picture: *Image* — \`${FILE_PATH}\` — ${TITLE}"
+        ;;
+    *)
+        echo "ERROR: Unknown type '$TYPE'. Use: html, google, pen, image" >&2
+        exit 1
+        ;;
+esac
+
+# Delegate to slack-post
+ARGS=("$MSG")
+if [ -n "$THREAD_TS" ]; then
+    ARGS+=("--thread" "$THREAD_TS")
+fi
+
+"${SCRIPT_DIR}/slack-post" "${ARGS[@]}"

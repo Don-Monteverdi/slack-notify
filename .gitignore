@@ -1,0 +1,15 @@
+# Config with secrets
+.env
+
+# Runtime files
+*.pid
+*.lock
+*.log
+
+# macOS
+.DS_Store
+
+# Editor
+*.swp
+*.swo
+*~

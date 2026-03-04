@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# slack-post — Post a message to Slack
+#
+# Usage:
+#   slack-post "message text"
+#   slack-post "message text" --channel C0OTHER
+#   slack-post "message text" --thread 1234567890.123456
+#
+# Supports Slack mrkdwn formatting: *bold*, _italic_, :emoji:, <url|text>
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/../lib/config.sh"
+
+# Parse arguments
+MESSAGE="${1:-}"
+CHANNEL="${SLACK_CHANNEL_ID}"
+THREAD_TS=""
+
+if [ -z "$MESSAGE" ]; then
+    echo "Usage: slack-post \"message text\" [--channel ID] [--thread TS]" >&2
+    exit 1
+fi
+
+shift
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --channel) CHANNEL="$2"; shift 2 ;;
+        --thread)  THREAD_TS="$2"; shift 2 ;;
+        *) echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
+done
+
+# Build JSON payload
+PAYLOAD=$(python3 -c "
+import json, sys
+payload = {
+    'channel': '$CHANNEL',
+    'text': sys.argv[1],
+    'unfurl_links': False
+}
+thread_ts = '$THREAD_TS'
+if thread_ts:
+    payload['thread_ts'] = thread_ts
+print(json.dumps(payload))
+" "$MESSAGE")
+
+# Post via Slack API
+RESPONSE=$(curl -s -X POST "https://slack.com/api/chat.postMessage" \
+    -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "$PAYLOAD")
+
+# Check response
+OK=$(echo "$RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print('ok' if d.get('ok') else d.get('error','unknown'))")
+
+if [ "$OK" = "ok" ]; then
+    TS=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ts',''))")
+    echo "Posted to #${SLACK_CHANNEL_NAME} (ts: $TS)"
+else
+    echo "ERROR: $OK" >&2
+    exit 1
+fi
